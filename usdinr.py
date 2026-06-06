@@ -5,7 +5,7 @@
 # =============================================================================
 # REQUIREMENTS (pip install these):
 #   streamlit yfinance pandas numpy matplotlib seaborn statsmodels
-#   scikit-learn plotly anthropic pandas_datareader requests beautifulsoup4
+#   scikit-learn plotly google-generativeai groq pandas_datareader requests beautifulsoup4
 # =============================================================================
 # RUN: streamlit run usd_inr_dashboard.py
 # =============================================================================
@@ -28,10 +28,23 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import adfuller
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import anthropic
 import json
 import io
 import time
+import re
+
+# AI providers — all free tier, imported lazily so missing packages don't crash
+try:
+    import google.generativeai as genai
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    _GEMINI_AVAILABLE = False
+
+try:
+    from groq import Groq
+    _GROQ_AVAILABLE = True
+except ImportError:
+    _GROQ_AVAILABLE = False
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -550,11 +563,8 @@ def forecast_levels(result, exog_future_scaled, last_level, steps=6) -> pd.DataF
 # AI HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def ai_scenario_analysis(news_text: str, macro_context: dict,
-                          current_rate: float, api_key: str) -> dict:
-    client = anthropic.Anthropic(api_key=api_key)
-
-    system = """You are a senior FX macro strategist specialising in USD/INR.
+# ── Shared prompt strings ─────────────────────────────────────────────────────
+_AI_SYSTEM = """You are a senior FX macro strategist specialising in USD/INR.
 You receive: (a) news/commentary, (b) live macro indicators, (c) current spot rate.
 Return ONLY valid JSON with exactly this schema (no markdown, no extra text):
 {
@@ -585,27 +595,128 @@ Return ONLY valid JSON with exactly this schema (no markdown, no extra text):
     "reasoning": "..."
   }
 }
-Probabilities must sum to 100. Be realistic. Current date: """ + datetime.today().strftime("%B %Y")
+Probabilities must sum to 100. Be realistic."""
 
-    user_msg = f"""NEWS / COMMENTARY:
-{news_text}
 
-MACRO CONTEXT:
-{json.dumps(macro_context, indent=2)}
-
-CURRENT USD/INR SPOT: {current_rate:.4f}
-
-Provide your scenario analysis."""
-
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1500,
-        system=system,
-        messages=[{"role": "user", "content": user_msg}]
+def _build_user_msg(news_text: str, macro_context: dict, current_rate: float) -> str:
+    return (
+        f"Current date: {datetime.today().strftime('%B %Y')}\n\n"
+        f"NEWS / COMMENTARY:\n{news_text}\n\n"
+        f"MACRO CONTEXT:\n{json.dumps(macro_context, indent=2)}\n\n"
+        f"CURRENT USD/INR SPOT: {current_rate:.4f}\n\n"
+        "Provide your scenario analysis."
     )
-    raw = message.content[0].text.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
+
+
+def _clean_json(raw: str) -> dict:
+    """Strip markdown fences and parse JSON; raises on failure."""
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
     return json.loads(raw)
+
+
+# ── Provider implementations ──────────────────────────────────────────────────
+
+def _call_gemini(news_text: str, macro_context: dict,
+                 current_rate: float, api_key: str) -> dict:
+    """
+    Google Gemini 2.0 Flash — free tier (1 500 req/day, no credit card needed).
+    Get key: https://aistudio.google.com/app/apikey
+    pip install google-generativeai
+    """
+    if not _GEMINI_AVAILABLE:
+        raise ImportError("google-generativeai not installed. Run: pip install google-generativeai")
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        system_instruction=_AI_SYSTEM,
+        generation_config=genai.GenerationConfig(
+            temperature=0.3,
+            max_output_tokens=1500,
+        ),
+    )
+    user_msg = _build_user_msg(news_text, macro_context, current_rate)
+    response = model.generate_content(user_msg)
+    return _clean_json(response.text)
+
+
+def _call_groq(news_text: str, macro_context: dict,
+               current_rate: float, api_key: str) -> dict:
+    """
+    Groq free tier — llama-3.3-70b-versatile.
+    Free: ~14 400 tokens/min, 500 req/day.
+    Get key: https://console.groq.com/keys
+    pip install groq
+    """
+    if not _GROQ_AVAILABLE:
+        raise ImportError("groq not installed. Run: pip install groq")
+
+    client = Groq(api_key=api_key)
+    user_msg = _build_user_msg(news_text, macro_context, current_rate)
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": _AI_SYSTEM},
+            {"role": "user",   "content": user_msg},
+        ],
+        temperature=0.3,
+        max_tokens=1500,
+        response_format={"type": "json_object"},   # Groq supports enforced JSON
+    )
+    return _clean_json(completion.choices[0].message.content)
+
+
+def _call_openrouter(news_text: str, macro_context: dict,
+                     current_rate: float, api_key: str,
+                     model: str = "meta-llama/llama-3.3-70b-instruct:free") -> dict:
+    """
+    OpenRouter free tier — multiple free models available.
+    Free models include: meta-llama/llama-3.3-70b-instruct:free,
+                         google/gemma-3-27b-it:free, mistralai/mistral-7b-instruct:free
+    Get key: https://openrouter.ai/keys
+    No extra pip install needed (uses requests).
+    """
+    user_msg = _build_user_msg(news_text, macro_context, current_rate)
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://usdinr-dashboard.streamlit.app",
+        },
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _AI_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1500,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"]
+    return _clean_json(raw)
+
+
+# ── Unified dispatcher ────────────────────────────────────────────────────────
+
+def ai_scenario_analysis(news_text: str, macro_context: dict,
+                          current_rate: float, api_key: str,
+                          provider: str = "gemini") -> dict:
+    """
+    Route to the chosen free AI provider.
+    provider: "gemini" | "groq" | "openrouter"
+    """
+    if provider == "gemini":
+        return _call_gemini(news_text, macro_context, current_rate, api_key)
+    elif provider == "groq":
+        return _call_groq(news_text, macro_context, current_rate, api_key)
+    elif provider == "openrouter":
+        return _call_openrouter(news_text, macro_context, current_rate, api_key)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
 
 def ai_quantify_scenario(scenario: str, macro_deltas: dict,
@@ -781,12 +892,55 @@ with st.sidebar:
     st.markdown('<div class="section-title">⚙ CONFIGURATION</div>',
                 unsafe_allow_html=True)
 
-    anthropic_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-...",
-        help="Required for AI scenario analysis. Get one at console.anthropic.com"
+    # ── AI Provider (all free) ────────────────────────────────────────────
+    st.markdown('<div class="section-title">🤖 AI PROVIDER (FREE)</div>',
+                unsafe_allow_html=True)
+
+    ai_provider = st.selectbox(
+        "Select AI Provider",
+        options=["gemini", "groq", "openrouter"],
+        format_func=lambda x: {
+            "gemini":      "Google Gemini 2.0 Flash  (1500 req/day free)",
+            "groq":        "Groq — Llama 3.3 70B  (500 req/day free)",
+            "openrouter":  "OpenRouter — Llama 3.3 70B :free",
+        }[x],
+        index=0,
+        help="All three are free. Gemini is recommended — most reliable JSON output."
     )
+
+    KEY_HELP = {
+        "gemini":     "Get free key → https://aistudio.google.com/app/apikey\npip install google-generativeai",
+        "groq":       "Get free key → https://console.groq.com/keys\npip install groq",
+        "openrouter": "Get free key → https://openrouter.ai/keys\n(no extra pip needed)",
+    }
+    KEY_PLACEHOLDER = {
+        "gemini":     "AIza...",
+        "groq":       "gsk_...",
+        "openrouter": "sk-or-...",
+    }
+
+    ai_api_key = st.text_input(
+        f"{ai_provider.title()} API Key",
+        type="password",
+        placeholder=KEY_PLACEHOLDER[ai_provider],
+        help=KEY_HELP[ai_provider],
+    )
+
+    if not ai_api_key:
+        st.caption(f"🔑 {KEY_HELP[ai_provider]}")
+
+    # OpenRouter model picker (shown only when openrouter selected)
+    openrouter_model = "meta-llama/llama-3.3-70b-instruct:free"
+    if ai_provider == "openrouter":
+        openrouter_model = st.selectbox(
+            "Free model",
+            options=[
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "google/gemma-3-27b-it:free",
+                "mistralai/mistral-7b-instruct:free",
+            ],
+            index=0,
+        )
 
     _fred_secret = st.secrets.get("FRED_API_KEY", "") if hasattr(st, "secrets") else ""
     fred_api_key = _fred_secret or st.text_input(
@@ -819,7 +973,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.caption("Data: Yahoo Finance, FRED (OECD). RBI Rate: FRED IRSTCB01INM156N + hardcoded patch. AI: Claude Sonnet.")
+    st.caption("Data: Yahoo Finance, FRED (OECD). RBI Rate: FRED IRSTCB01INM156N + hardcoded patch. AI: Gemini / Groq / OpenRouter (free).")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1184,9 +1338,9 @@ with tab2:
     with col_ai1:
         run_ai = st.button("🤖 Run AI Scenario Analysis", type="primary",
                            width='stretch',
-                           disabled=(not anthropic_key or not news_input.strip()))
-        if not anthropic_key:
-            st.warning("Enter Anthropic API key in sidebar to enable AI analysis.")
+                           disabled=(not ai_api_key or not news_input.strip()))
+        if not ai_api_key:
+            st.warning(f"Enter your {ai_provider.title()} API key in the sidebar to enable AI analysis.")
 
     if run_ai:
         macro_ctx = {
@@ -1199,16 +1353,33 @@ with tab2:
             "US_CPI_YoY":     round(float(combined["CPI_USA"].iloc[-1]),         2) if "CPI_USA"             in combined else "N/A",
         }
 
-        with st.spinner("Calling Claude for scenario analysis..."):
+        spinner_label = {
+            "gemini":     "Calling Gemini 2.0 Flash...",
+            "groq":       "Calling Groq (Llama 3.3 70B)...",
+            "openrouter": "Calling OpenRouter...",
+        }[ai_provider]
+
+        with st.spinner(spinner_label):
             try:
-                ai_result = ai_scenario_analysis(
-                    news_input, macro_ctx, spot_rate, anthropic_key
-                )
+                # Pass openrouter model string if needed
+                if ai_provider == "openrouter":
+                    ai_result = _call_openrouter(
+                        news_input, macro_ctx, spot_rate, ai_api_key,
+                        model=openrouter_model
+                    )
+                else:
+                    ai_result = ai_scenario_analysis(
+                        news_input, macro_ctx, spot_rate, ai_api_key,
+                        provider=ai_provider
+                    )
+            except ImportError as e:
+                st.error(f"Missing package: {e}")
+                ai_result = None
             except json.JSONDecodeError as e:
                 st.error(f"AI returned invalid JSON: {e}")
                 ai_result = None
             except Exception as e:
-                st.error(f"AI error: {e}")
+                st.error(f"AI error ({ai_provider}): {e}")
                 ai_result = None
 
         if ai_result:
@@ -1299,7 +1470,7 @@ with tab2:
                 pass
         if demo:
             st.plotly_chart(plot_scenarios(y, demo), width='stretch')
-        st.info("💡 Enter your Anthropic API key and paste news to activate AI analysis.")
+        st.info("💡 Select a free AI provider in the sidebar, enter your API key, and paste news to activate AI analysis.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
