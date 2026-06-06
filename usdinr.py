@@ -233,27 +233,47 @@ def load_live_usdinr(period_years: int = 10) -> pd.DataFrame:
 
 @st.cache_data(ttl=86400)
 def load_macro_fred(start="2014-01-01"):
-    """Try to pull FRED macro series; fall back to synthetic if unavailable."""
+    """
+    Fetch FRED macro series one-by-one so a single failure doesn't kill all data.
+    Returns (DataFrame, pct_fetched) where pct_fetched = 0.0-1.0.
+    """
     try:
         import pandas_datareader.data as web
-        s = datetime.strptime(start, "%Y-%m-%d")
-        e = datetime.today()
-        fred = pd.DataFrame()
-        fred["CPI_USA"]             = web.DataReader("MEDCPIM158SFRBCLE", "fred", s, e)
-        fred["Crude_Oil"]           = web.DataReader("DCOILWTICO",         "fred", s, e)
-        fred["Trade_Balance_India"] = web.DataReader("XTEXVA01INM667S",    "fred", s, e)
-        fred["US_Rate_EFFR"]        = web.DataReader("FEDFUNDS",            "fred", s, e)
-        fred.reset_index(inplace=True)
-        fred.rename(columns={"DATE": "Date"}, inplace=True)
-        fred["Date"] = pd.to_datetime(fred["Date"]) - MonthBegin(1)
-        fred.set_index("Date", inplace=True)
-        for c in ["CPI_USA", "Crude_Oil"]:
+    except ImportError:
+        return None, 0.0
+
+    s = datetime.strptime(start, "%Y-%m-%d")
+    e = datetime.today()
+
+    SERIES = {
+        "CPI_USA":             "MEDCPIM158SFRBCLE",
+        "Crude_Oil":           "DCOILWTICO",
+        "Trade_Balance_India": "XTEXVA01INM667S",
+        "US_Rate_EFFR":        "FEDFUNDS",
+    }
+
+    frames = {}
+    for col, code in SERIES.items():
+        try:
+            raw = web.DataReader(code, "fred", s, e)
+            raw.index = pd.to_datetime(raw.index)
+            raw.index.name = "Date"
+            frames[col] = raw.iloc[:, 0].rename(col)
+        except Exception:
+            pass   # individual series failed; skip it
+
+    if not frames:
+        return None, 0.0
+
+    fred = pd.concat(frames.values(), axis=1)
+    fred.index = fred.index - MonthBegin(1)
+    for c in ["CPI_USA", "Crude_Oil"]:
+        if c in fred.columns:
             fred[c] = fred[c].interpolate(method="linear", limit_direction="both")
-        fred = fred.resample("MS").mean()
-        fred.dropna(inplace=True)
-        return fred, True
-    except Exception:
-        return None, False
+    fred = fred.resample("MS").mean()
+
+    pct = len(frames) / len(SERIES)
+    return fred, pct
 
 
 def build_synthetic_macro(idx: pd.DatetimeIndex) -> pd.DataFrame:
@@ -593,7 +613,7 @@ with st.sidebar:
     use_fred = st.toggle("Fetch macro from FRED", value=True)
 
     st.markdown("---")
-    if st.button("🔄 Refresh All Data", use_container_width=True):
+    if st.button("🔄 Refresh All Data", width='stretch'):
         st.cache_data.clear()
         st.rerun()
 
@@ -639,10 +659,18 @@ with st.spinner("Fetching live USD/INR data..."):
         )
 
     if use_fred:
-        macro_df, fred_ok = load_macro_fred(f"{datetime.today().year - data_years}-01-01")
-        if not fred_ok or macro_df is None:
+        macro_df, fred_pct = load_macro_fred(f"{datetime.today().year - data_years}-01-01")
+        if macro_df is None or fred_pct == 0.0:
             macro_df = build_synthetic_macro(usdinr_monthly.index)
             st.warning("⚠ FRED unavailable — using synthetic macro data for modelling.", icon="⚠")
+        elif fred_pct < 1.0:
+            synth = build_synthetic_macro(usdinr_monthly.index)
+            for col in synth.columns:
+                if col not in macro_df.columns:
+                    macro_df[col] = synth[col]
+            st.info(f"ℹ FRED: {int(fred_pct*100)}% of series fetched — missing columns filled with synthetic estimates.")
+        else:
+            st.success("✅ All FRED macro series loaded successfully.")
     else:
         macro_df = build_synthetic_macro(usdinr_monthly.index)
 
@@ -741,7 +769,7 @@ with tab1:
                                       steps=forecast_months)
 
     fig1 = plot_usdinr(y, forecast_df)
-    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig1, width='stretch')
 
     # Forecast table
     st.markdown('<div class="section-title">FORECAST VALUES</div>',
@@ -750,7 +778,7 @@ with tab1:
     fc_display.index = fc_display.index.strftime("%b %Y")
     fc_display.columns = ["Forecast USD/INR", "Lower 95% CI", "Upper 95% CI"]
     fc_display = fc_display.round(4)
-    st.dataframe(fc_display, use_container_width=True)
+    st.dataframe(fc_display, width='stretch')
 
     # Train-test backtest
     with st.expander("📉 Backtest Performance (Train/Test Split)"):
@@ -780,7 +808,7 @@ with tab1:
                 name="Predicted", line=dict(color="#f97316", dash="dash", width=2)))
             fig_bt.update_layout(title="Backtest: Actual vs Predicted USD/INR",
                                  **PLOTLY_LAYOUT)
-            st.plotly_chart(fig_bt, use_container_width=True)
+            st.plotly_chart(fig_bt, width='stretch')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -811,7 +839,7 @@ with tab2:
     col_ai1, col_ai2 = st.columns([1, 2])
     with col_ai1:
         run_ai = st.button("🤖 Run AI Scenario Analysis", type="primary",
-                           use_container_width=True,
+                           width='stretch',
                            disabled=(not anthropic_key or not news_input.strip()))
         if not anthropic_key:
             st.warning("Enter Anthropic API key in sidebar to enable AI analysis.")
@@ -900,7 +928,7 @@ with tab2:
 
             if scenarios_fc:
                 fig_fan = plot_scenarios(y, scenarios_fc)
-                st.plotly_chart(fig_fan, use_container_width=True)
+                st.plotly_chart(fig_fan, width='stretch')
 
             # ── Comparison table ──────────────────────────────────────────
             st.markdown('<div class="section-title">SCENARIO COMPARISON TABLE</div>',
@@ -917,7 +945,7 @@ with tab2:
                     "Model 6M":   f"₹{df_s['Forecast'].iloc[-1]:.4f}" if not df_s.empty else "—",
                     "Direction":  sc.get("direction", "—"),
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
     else:
         # Demo fan chart (no AI key needed)
@@ -932,7 +960,7 @@ with tab2:
             except Exception:
                 pass
         if demo:
-            st.plotly_chart(plot_scenarios(y, demo), use_container_width=True)
+            st.plotly_chart(plot_scenarios(y, demo), width='stretch')
         st.info("💡 Enter your Anthropic API key and paste news to activate AI analysis.")
 
 
@@ -944,7 +972,7 @@ with tab3:
                 unsafe_allow_html=True)
     if len(combined) >= 24:
         st.plotly_chart(plot_seasonality(combined["USD_INR"]),
-                        use_container_width=True)
+                        width='stretch')
 
         # Rolling stats table
         st.markdown('<div class="section-title">MONTHLY RETURN STATISTICS</div>',
@@ -960,7 +988,7 @@ with tab3:
         month_order = ["January","February","March","April","May","June",
                        "July","August","September","October","November","December"]
         stats = stats.reindex([m for m in month_order if m in stats.index])
-        st.dataframe(stats, use_container_width=True)
+        st.dataframe(stats, width='stretch')
     else:
         st.warning("Need ≥24 months of data for seasonality analysis.")
 
@@ -983,7 +1011,7 @@ with tab4:
                 "Diff ADF p-val": dff["pval"],
                 "Diff Stationary": "✅" if dff["stationary"] else "❌",
             })
-    st.dataframe(pd.DataFrame(adf_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(adf_rows), width='stretch', hide_index=True)
 
     st.markdown('<div class="section-title">MODEL SUMMARY</div>',
                 unsafe_allow_html=True)
@@ -992,14 +1020,24 @@ with tab4:
 
     st.markdown('<div class="section-title">RESIDUAL DIAGNOSTICS</div>',
                 unsafe_allow_html=True)
-    st.plotly_chart(plot_residuals(result.resid), use_container_width=True)
+    st.plotly_chart(plot_residuals(result.resid), width='stretch')
 
-    # Coefficient table
+    # Coefficient table — built manually (SARIMAXResults has no summary2())
     st.markdown('<div class="section-title">COEFFICIENT TABLE</div>',
                 unsafe_allow_html=True)
-    tbl = result.summary2().tables[1]
-    if isinstance(tbl, pd.DataFrame):
-        st.dataframe(tbl.round(4), use_container_width=True)
+    try:
+        coeff_df = pd.DataFrame({
+            "Coefficient": result.params,
+            "Std Error":   result.bse,
+            "z-stat":      result.tvalues,
+            "p-value":     result.pvalues,
+        }).round(4)
+        coeff_df["Significant"] = coeff_df["p-value"].apply(
+            lambda p: "✅" if p < 0.05 else ("⚠" if p < 0.1 else "❌")
+        )
+        st.dataframe(coeff_df, width="stretch")
+    except Exception as e:
+        st.warning(f"Could not build coefficient table: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1012,7 +1050,7 @@ with tab5:
     st.plotly_chart(plot_correlation(
         pd.DataFrame(StandardScaler().fit_transform(combined),
                      columns=combined.columns, index=combined.index)
-    ), use_container_width=True)
+    ), width='stretch')
 
     # Individual series charts
     st.markdown('<div class="section-title">TIME SERIES — KEY DRIVERS</div>',
@@ -1039,7 +1077,7 @@ with tab5:
             ), row=r + 1, col=c + 1)
         fig_macro.update_layout(height=220 * rows, showlegend=False,
                                 **PLOTLY_LAYOUT)
-        st.plotly_chart(fig_macro, use_container_width=True)
+        st.plotly_chart(fig_macro, width='stretch')
 
     # Raw data download
     st.markdown('<div class="section-title">RAW DATA EXPORT</div>',
@@ -1050,7 +1088,7 @@ with tab5:
         data=csv,
         file_name=f"usd_inr_macro_{datetime.today().strftime('%Y%m%d')}.csv",
         mime="text/csv",
-        use_container_width=True
+        width='stretch'
     )
 
 # ── Footer ────────────────────────────────────────────────────────────────────
