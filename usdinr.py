@@ -1032,33 +1032,127 @@ with tab1:
     st.dataframe(fc_display, width='stretch')
 
     with st.expander("📉 Backtest Performance (Train/Test Split)"):
-        split = "2023-01-01"
-        y_tr  = y_diff.loc[:split]; y_te = y_diff.loc[split:]
-        ex_tr = exog_scaled.loc[y_tr.index]; ex_te = exog_scaled.loc[y_te.index]
+        # ── Why rolling one-step-ahead? ────────────────────────────────────
+        # A multi-step cumsum reconstruction accumulates bias: each month's
+        # error gets added to every future month, so a 42-step backtest
+        # produces a chart that drifts ₹30+ from reality even if monthly
+        # predictions are reasonable. Rolling one-step-ahead re-anchors each
+        # prediction to the *actual* previous level, so errors stay local.
+        # ──────────────────────────────────────────────────────────────────
+
+        # Allow user to choose test window (12–24 months is meaningful)
+        test_months = st.slider(
+            "Test window (months)", min_value=12, max_value=24,
+            value=18, step=3,
+            help="Shorter windows reduce cumulative drift and give a cleaner picture of recent model skill."
+        )
+        split_dt = y_diff.index[-test_months]
+        y_tr  = y_diff.loc[:split_dt]
+        y_te  = y_diff.loc[split_dt:]
+        ex_tr = exog_scaled.loc[y_tr.index]
+        ex_te = exog_scaled.loc[y_te.index]
 
         if len(y_te) >= 3:
+            # Fit on training window
             m_tt = SARIMAX(y_tr, exog=ex_tr, order=(p_order, d_order, q_order),
                            enforce_stationarity=False, enforce_invertibility=False)
             r_tt = m_tt.fit(disp=False)
-            fc_te = r_tt.get_forecast(steps=len(y_te), exog=ex_te)
-            y_pr  = fc_te.predicted_mean
-            mae   = mean_absolute_error(y_te, y_pr)
-            rmse  = np.sqrt(mean_squared_error(y_te, y_pr))
-            last_tr_level = y.loc[y_tr.index[-1]]
-            lvl_pred = last_tr_level + y_pr.cumsum()
-            lvl_act  = y.loc[y_te.index]
-            bc1, bc2, bc3 = st.columns(3)
-            bc1.metric("MAE (MoM diff)", f"{mae:.4f}")
-            bc2.metric("RMSE (MoM diff)", f"{rmse:.4f}")
-            bc3.metric("Test Periods", str(len(y_te)))
+
+            # ── Rolling one-step-ahead predictions ────────────────────────
+            # Apply the model to the full sample (train+test) and extract
+            # only the test-period fitted values.  get_prediction on the
+            # in-sample portion gives genuine one-step-ahead values because
+            # statsmodels uses the Kalman filter recursively.
+            full_y_diff  = y_diff.loc[y_tr.index[0]:]
+            full_ex_sc   = exog_scaled.loc[y_tr.index[0]:]
+            pred_full    = r_tt.apply(full_y_diff, exog=full_ex_sc)
+            one_step_res = pred_full.get_prediction(
+                start=y_te.index[0], end=y_te.index[-1],
+                exog=ex_te
+            )
+            y_pr_diff = one_step_res.predicted_mean      # predicted MoM diffs
+            ci_df     = one_step_res.conf_int()
+
+            # ── Reconstruct levels using actual lagged price (no drift) ───
+            # For each test month t: level(t) = actual_level(t-1) + pred_diff(t)
+            lvl_actual = y.loc[y_te.index]
+            lvl_actual_lag = y.shift(1).loc[y_te.index]
+            lvl_pred   = lvl_actual_lag + y_pr_diff.values
+
+            # CI bands in level space (symmetric around predicted level)
+            ci_half   = (ci_df.iloc[:, 1] - ci_df.iloc[:, 0]) / 2
+            lvl_lo    = lvl_pred - ci_half.values
+            lvl_hi    = lvl_pred + ci_half.values
+
+            # ── Error metrics on MoM diffs (apples-to-apples) ─────────────
+            mae  = mean_absolute_error(y_te.loc[y_pr_diff.index], y_pr_diff)
+            rmse = np.sqrt(mean_squared_error(y_te.loc[y_pr_diff.index], y_pr_diff))
+
+            # Level-space MAE (more interpretable: "off by X rupees on average")
+            lvl_mae = mean_absolute_error(
+                lvl_actual.loc[lvl_pred.index].dropna(),
+                lvl_pred.loc[lvl_actual.loc[lvl_pred.index].dropna().index]
+            )
+
+            bc1, bc2, bc3, bc4 = st.columns(4)
+            bc1.metric("MAE (MoM diff ₹)", f"{mae:.4f}",
+                       help="Mean absolute error on month-over-month differences")
+            bc2.metric("RMSE (MoM diff ₹)", f"{rmse:.4f}",
+                       help="Root mean squared error on MoM differences")
+            bc3.metric("Level MAE (₹)", f"{lvl_mae:.4f}",
+                       help="Average rupee error in level-space — most intuitive measure")
+            bc4.metric("Test Periods", str(len(y_te)))
+
+            # ── Chart ─────────────────────────────────────────────────────
             fig_bt = go.Figure()
-            fig_bt.add_trace(go.Scatter(x=lvl_act.index, y=lvl_act.values,
-                name="Actual", line=dict(color="#f7c948", width=2)))
-            fig_bt.add_trace(go.Scatter(x=lvl_pred.index, y=lvl_pred.values,
-                name="Predicted", line=dict(color="#f97316", dash="dash", width=2)))
-            fig_bt.update_layout(title="Backtest: Actual vs Predicted USD/INR",
-                                 **PLOTLY_LAYOUT)
+
+            # CI band
+            idx_fwd  = lvl_pred.index
+            idx_rev  = idx_fwd[::-1]
+            fig_bt.add_trace(go.Scatter(
+                x=pd.concat([idx_fwd.to_series(), idx_rev.to_series()]),
+                y=pd.concat([pd.Series(lvl_hi, index=idx_fwd),
+                             pd.Series(lvl_lo[::-1], index=idx_rev)]),
+                fill="toself", fillcolor="rgba(249,115,22,0.10)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="95% CI", showlegend=True
+            ))
+
+            # Actual (show 6 months of training context too)
+            context_start = y_tr.index[-6]
+            fig_bt.add_trace(go.Scatter(
+                x=lvl_actual.loc[context_start:].index,
+                y=y.loc[context_start:y_te.index[-1]].values,
+                name="Actual USD/INR",
+                line=dict(color="#f7c948", width=2)
+            ))
+
+            # Predicted (one-step-ahead levels)
+            fig_bt.add_trace(go.Scatter(
+                x=lvl_pred.index, y=lvl_pred.values,
+                name="Predicted (1-step-ahead)",
+                line=dict(color="#f97316", dash="dash", width=2)
+            ))
+
+            # Train/test boundary
+            fig_bt.add_vline(
+                x=str(y_te.index[0]),
+                line=dict(color="#475569", dash="dot", width=1),
+                annotation_text="Test start",
+                annotation_font_color="#64748b"
+            )
+
+            fig_bt.update_layout(
+                title="Backtest: Actual vs One-Step-Ahead Predicted USD/INR",
+                **PLOTLY_LAYOUT
+            )
             st.plotly_chart(fig_bt, width='stretch')
+
+            st.caption(
+                "ℹ️ **One-step-ahead method**: each month's prediction is anchored to the "
+                "actual prior month's price, so errors don't compound across periods. "
+                "This gives a realistic picture of month-to-month forecasting skill."
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
