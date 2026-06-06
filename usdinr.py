@@ -328,9 +328,15 @@ def get_live_spot_rate() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_adf(series: pd.Series) -> dict:
-    r = adfuller(series.dropna())
-    return {"stat": round(r[0], 4), "pval": round(r[1], 4),
-            "stationary": r[1] < 0.05}
+    s = series.dropna()
+    if len(s) < 10 or s.max() == s.min():
+        return {"stat": None, "pval": None, "stationary": None}
+    try:
+        r = adfuller(s)
+        return {"stat": round(r[0], 4), "pval": round(r[1], 4),
+                "stationary": r[1] < 0.05}
+    except Exception:
+        return {"stat": None, "pval": None, "stationary": None}
 
 
 def fit_arimax(y_diff, exog_scaled, order=(1, 1, 0)) -> SARIMAX:
@@ -699,11 +705,15 @@ with st.spinner("Fetching live USD/INR data..."):
 
 # Merge USD/INR + Macro
 combined = usdinr_monthly.join(macro_df, how="inner")
-if "RBI_Repo_Rate" not in combined.columns:
-    combined["RBI_Repo_Rate"]      = 6.5
-    combined["Total_Reserves_USD"] = 600
-    combined["Ind_CPI"]            = 5.5
-combined = combined.ffill().dropna()
+
+# Fill any missing macro columns with synthetic (never constants — ADF will crash)
+_synth = build_synthetic_macro(usdinr_monthly.index)
+for _col in ["RBI_Repo_Rate", "Total_Reserves_USD", "Ind_CPI",
+             "CPI_USA", "Crude_Oil", "Trade_Balance_India", "US_Rate_EFFR"]:
+    if _col not in combined.columns and _col in _synth.columns:
+        combined[_col] = _synth[_col].reindex(combined.index).ffill().bfill()
+
+combined = combined.ffill().bfill().dropna()
 
 FEATURE_COLS = [c for c in ["CPI_USA","Crude_Oil","Trade_Balance_India",
                              "US_Rate_EFFR","RBI_Repo_Rate","Total_Reserves_USD","Ind_CPI"]
@@ -1027,14 +1037,17 @@ with tab4:
         if col in combined.columns:
             lvl = run_adf(combined[col])
             dff = run_adf(combined[col].diff().dropna())
+            def _stat_label(r):
+                if r["stationary"] is None: return "—"
+                return "✅" if r["stationary"] else "❌"
             adf_rows.append({
-                "Variable": col,
-                "Level ADF p-val": lvl["pval"],
-                "Level Stationary": "✅" if lvl["stationary"] else "❌",
-                "Diff ADF p-val": dff["pval"],
-                "Diff Stationary": "✅" if dff["stationary"] else "❌",
+                "Variable":         col,
+                "Level ADF p-val":  lvl["pval"] if lvl["pval"] is not None else "—",
+                "Level Stationary": _stat_label(lvl),
+                "Diff ADF p-val":   dff["pval"] if dff["pval"] is not None else "—",
+                "Diff Stationary":  _stat_label(dff),
             })
-    st.dataframe(pd.DataFrame(adf_rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(adf_rows), width="stretch", hide_index=True)
 
     st.markdown('<div class="section-title">MODEL SUMMARY</div>',
                 unsafe_allow_html=True)
