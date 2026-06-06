@@ -289,7 +289,7 @@ def load_macro_fred(start="2014-01-01", api_key: str = ""):
 
 
 def build_synthetic_macro(idx: pd.DatetimeIndex) -> pd.DataFrame:
-    """Generate plausible synthetic macro data when FRED is unavailable."""
+    """Generate plausible synthetic macro data when live sources are unavailable."""
     n = len(idx)
     np.random.seed(42)
     df = pd.DataFrame(index=idx)
@@ -305,6 +305,165 @@ def build_synthetic_macro(idx: pd.DatetimeIndex) -> pd.DataFrame:
     df["Total_Reserves_USD"]  = 600 + np.cumsum(np.random.normal(1, 5, n))
     df["Ind_CPI"]             = 5   + np.random.normal(0, 0.5, n)
     return df
+
+
+@st.cache_data(ttl=86400)
+def load_rbi_repo_rate() -> tuple:
+    """
+    Fetch RBI Repo Rate history from RBI's DBIE portal.
+    Tries multiple public RBI endpoints and falls back gracefully.
+    Returns (Series | None, source_label).
+    """
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/html, */*",
+    }
+
+    # ── Attempt 1: RBI DBIE REST API (repo rate series ID: II-B-1) ──
+    try:
+        url = (
+            "https://api.rbi.org.in/api/v3/findbyfacets?"
+            "facets=B02&startDate=2010-01-01"
+            f"&endDate={datetime.today().strftime('%Y-%m-%d')}"
+            "&frequency=M&lang=EN"
+        )
+        resp = requests.get(url, headers=HEADERS, timeout=12)
+        data = resp.json()
+        records = data.get("data", data.get("Data", []))
+        if records:
+            df = pd.DataFrame(records)
+            # column names vary — try to find date + value cols
+            date_col  = next((c for c in df.columns if "date" in c.lower()), None)
+            val_col   = next((c for c in df.columns if any(
+                k in c.lower() for k in ["repo","rate","value","val"])), None)
+            if date_col and val_col:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                df[val_col]  = pd.to_numeric(df[val_col], errors="coerce")
+                s = df.dropna(subset=[date_col, val_col]).set_index(date_col)[val_col]
+                s.index = s.index - MonthBegin(1)
+                s = s.resample("MS").last().rename("RBI_Repo_Rate")
+                if len(s) > 12:
+                    return s, "RBI DBIE API"
+    except Exception:
+        pass
+
+    # ── Attempt 2: RBI DBIE CSV download (key monetary rates table) ──
+    try:
+        csv_url = (
+            "https://rbidbie.rbi.org.in/scripts/BS_NSDPDisplay.aspx"
+            "?param=B&Series=B02&DateRange=2010-2025&Language=EN&output=csv"
+        )
+        resp = requests.get(csv_url, headers=HEADERS, timeout=15)
+        df   = pd.read_csv(io.StringIO(resp.text), skiprows=2)
+        df.columns = [c.strip() for c in df.columns]
+        date_col = df.columns[0]
+        rate_col = next((c for c in df.columns if "repo" in c.lower()), df.columns[1])
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+        df[rate_col] = pd.to_numeric(
+            df[rate_col].astype(str).str.replace("%","").str.strip(), errors="coerce"
+        )
+        s = df.dropna(subset=[date_col, rate_col]).set_index(date_col)[rate_col]
+        s.index = s.index - MonthBegin(1)
+        s = s.resample("MS").last().rename("RBI_Repo_Rate")
+        if len(s) > 12:
+            return s, "RBI DBIE CSV"
+    except Exception:
+        pass
+
+    # ── Attempt 3: Wikipedia / known public table ──
+    try:
+        wiki_url = "https://en.wikipedia.org/wiki/Repo_rate_in_India"
+        resp  = requests.get(wiki_url, headers=HEADERS, timeout=12)
+        dfs   = pd.read_html(io.StringIO(resp.text))
+        for df in dfs:
+            df.columns = [str(c).lower().strip() for c in df.columns]
+            if any("repo" in c or "rate" in c for c in df.columns):
+                date_col = next((c for c in df.columns if "date" in c or "year" in c), None)
+                rate_col = next((c for c in df.columns if "repo" in c or "rate" in c), None)
+                if date_col and rate_col:
+                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+                    df[rate_col] = pd.to_numeric(
+                        df[rate_col].astype(str).str.replace("%",""), errors="coerce"
+                    )
+                    s = df.dropna(subset=[date_col, rate_col]).set_index(date_col)[rate_col]
+                    s.index = s.index - MonthBegin(1)
+                    s = s.resample("MS").last().ffill().rename("RBI_Repo_Rate")
+                    if len(s) > 12:
+                        return s, "Wikipedia (public)"
+    except Exception:
+        pass
+
+    return None, "Synthetic"
+
+
+@st.cache_data(ttl=86400)
+def load_rbi_fx_reserves() -> tuple:
+    """
+    Fetch India FX Reserves from RBI DBIE or FRED (as fallback).
+    Returns (Series | None, source_label).
+    """
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+    # ── Try FRED first (RESIRUSD = India total reserves) ──
+    try:
+        fred_key = st.session_state.get("fred_api_key", "")
+        if fred_key:
+            url = (
+                f"https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id=RESIRUSD&observation_start=2010-01-01"
+                f"&api_key={fred_key}&file_type=json"
+            )
+            resp = requests.get(url, timeout=12)
+            obs  = resp.json().get("observations", [])
+            if obs:
+                df = pd.DataFrame(obs)[["date","value"]]
+                df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                df["date"]  = pd.to_datetime(df["date"])
+                s = df.dropna().set_index("date")["value"] / 1e9  # convert to USD bn
+                s.index = s.index - MonthBegin(1)
+                s = s.resample("MS").last().rename("Total_Reserves_USD")
+                if len(s) > 12:
+                    return s, "FRED (RESIRUSD)"
+    except Exception:
+        pass
+
+    return None, "Synthetic"
+
+
+@st.cache_data(ttl=86400)
+def load_india_cpi_rbi(fred_key: str = "") -> tuple:
+    """
+    Fetch India CPI from FRED series INDCPIALLMINMEI.
+    Returns (Series | None, source_label).
+    """
+    if not fred_key:
+        return None, "Synthetic"
+    try:
+        url = (
+            f"https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id=INDCPIALLMINMEI&observation_start=2010-01-01"
+            f"&api_key={fred_key}&file_type=json"
+        )
+        resp = requests.get(url, timeout=12)
+        obs  = resp.json().get("observations", [])
+        if obs:
+            df = pd.DataFrame(obs)[["date","value"]]
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df["date"]  = pd.to_datetime(df["date"])
+            s = df.dropna().set_index("date")["value"]
+            # convert index level to YoY %
+            s = s.pct_change(12) * 100
+            s.index = s.index - MonthBegin(1)
+            s = s.resample("MS").last().rename("Ind_CPI")
+            if len(s) > 12:
+                return s, "FRED (INDCPIALLMINMEI)"
+    except Exception:
+        pass
+    return None, "Synthetic"
 
 
 @st.cache_data(ttl=3600)
@@ -673,45 +832,90 @@ st.markdown("---")
 # LOAD DATA
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with st.spinner("Fetching live USD/INR data..."):
+# ── Store fred key in session state so cache functions can read it ──
+st.session_state["fred_api_key"] = fred_api_key
+
+with st.spinner("Fetching live data from all sources..."):
     spot = get_live_spot_rate()
 
+    # ── USD/INR (Yahoo Finance) ──
     if use_live:
         usdinr_monthly = load_live_usdinr(data_years)
+        usdinr_source  = "Yahoo Finance (live)" if not usdinr_monthly.empty else "Synthetic"
     else:
-        # Synthetic fallback
         idx = pd.date_range("2014-01-01", datetime.today(), freq="MS")
         np.random.seed(7)
         usdinr_monthly = pd.DataFrame(
             {"USD_INR": 63 + np.cumsum(np.random.normal(0.2, 0.5, len(idx)))},
             index=idx
         )
+        usdinr_source = "Synthetic"
 
-    if use_fred:
-        macro_df, fred_pct = load_macro_fred(f"{datetime.today().year - data_years}-01-01", api_key=fred_api_key)
+    # ── FRED macro series (US data) ──
+    DATA_SOURCES = {}   # col -> source label
+    if use_fred and fred_api_key:
+        macro_df, fred_pct = load_macro_fred(
+            f"{datetime.today().year - data_years}-01-01", api_key=fred_api_key
+        )
         if macro_df is None or fred_pct == 0.0:
             macro_df = build_synthetic_macro(usdinr_monthly.index)
-            st.warning("⚠ FRED unavailable — using synthetic macro data for modelling.", icon="⚠")
-        elif fred_pct < 1.0:
-            synth = build_synthetic_macro(usdinr_monthly.index)
-            for col in synth.columns:
-                if col not in macro_df.columns:
-                    macro_df[col] = synth[col]
-            st.info(f"ℹ FRED: {int(fred_pct*100)}% of series fetched — missing columns filled with synthetic estimates.")
+            for c in ["CPI_USA","Crude_Oil","Trade_Balance_India","US_Rate_EFFR"]:
+                DATA_SOURCES[c] = "Synthetic"
         else:
-            st.success("✅ All FRED macro series loaded successfully.")
+            for c in macro_df.columns:
+                DATA_SOURCES[c] = "FRED (live)"
+            if fred_pct < 1.0:
+                synth = build_synthetic_macro(usdinr_monthly.index)
+                for col in synth.columns:
+                    if col not in macro_df.columns:
+                        macro_df[col] = synth[col]
+                        DATA_SOURCES[col] = "Synthetic"
     else:
         macro_df = build_synthetic_macro(usdinr_monthly.index)
+        for c in macro_df.columns:
+            DATA_SOURCES[c] = "Synthetic (no FRED key)"
 
-# Merge USD/INR + Macro
-combined = usdinr_monthly.join(macro_df, how="inner")
+    # ── RBI Repo Rate ──
+    rbi_series, rbi_source = load_rbi_repo_rate()
+    DATA_SOURCES["RBI_Repo_Rate"] = rbi_source
 
-# Fill any missing macro columns with synthetic (never constants — ADF will crash)
-_synth = build_synthetic_macro(usdinr_monthly.index)
+    # ── India FX Reserves (FRED RESIRUSD or synthetic) ──
+    reserves_series, reserves_source = load_rbi_fx_reserves()
+    DATA_SOURCES["Total_Reserves_USD"] = reserves_source
+
+    # ── India CPI (FRED INDCPIALLMINMEI or synthetic) ──
+    ind_cpi_series, ind_cpi_source = load_india_cpi_rbi(fred_key=fred_api_key)
+    DATA_SOURCES["Ind_CPI"] = ind_cpi_source
+
+    DATA_SOURCES["USD_INR"] = usdinr_source
+
+# ── Merge all sources into one DataFrame ──
+combined = usdinr_monthly.copy()
+
+# Merge FRED macro
+if macro_df is not None:
+    combined = combined.join(macro_df, how="left")
+
+# Override with live RBI Repo Rate if fetched
+if rbi_series is not None and rbi_source != "Synthetic":
+    rbi_reindexed = rbi_series.reindex(combined.index).ffill().bfill()
+    combined["RBI_Repo_Rate"] = rbi_reindexed
+
+# Override with live FX Reserves if fetched
+if reserves_series is not None and reserves_source != "Synthetic":
+    combined["Total_Reserves_USD"] = reserves_series.reindex(combined.index).ffill().bfill()
+
+# Override with live India CPI if fetched
+if ind_cpi_series is not None and ind_cpi_source != "Synthetic":
+    combined["Ind_CPI"] = ind_cpi_series.reindex(combined.index).ffill().bfill()
+
+# Fill any still-missing columns with synthetic (never scalar constants — ADF crashes)
+_synth = build_synthetic_macro(combined.index)
 for _col in ["RBI_Repo_Rate", "Total_Reserves_USD", "Ind_CPI",
              "CPI_USA", "Crude_Oil", "Trade_Balance_India", "US_Rate_EFFR"]:
-    if _col not in combined.columns and _col in _synth.columns:
+    if _col not in combined.columns or combined[_col].isna().all():
         combined[_col] = _synth[_col].reindex(combined.index).ffill().bfill()
+        DATA_SOURCES[_col] = "Synthetic"
 
 combined = combined.ffill().bfill().dropna()
 
