@@ -232,18 +232,14 @@ def load_live_usdinr(period_years: int = 10) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400)
-def load_macro_fred(start="2014-01-01"):
+def load_macro_fred(start="2014-01-01", api_key: str = ""):
     """
-    Fetch FRED macro series one-by-one so a single failure doesn't kill all data.
-    Returns (DataFrame, pct_fetched) where pct_fetched = 0.0-1.0.
+    Fetch FRED macro series via direct REST API (requires free FRED API key).
+    Falls back gracefully series-by-series.
+    Returns (DataFrame | None, pct_fetched 0.0-1.0).
     """
-    try:
-        import pandas_datareader.data as web
-    except ImportError:
+    if not api_key:
         return None, 0.0
-
-    s = datetime.strptime(start, "%Y-%m-%d")
-    e = datetime.today()
 
     SERIES = {
         "CPI_USA":             "MEDCPIM158SFRBCLE",
@@ -252,15 +248,31 @@ def load_macro_fred(start="2014-01-01"):
         "US_Rate_EFFR":        "FEDFUNDS",
     }
 
+    end_date   = datetime.today().strftime("%Y-%m-%d")
     frames = {}
-    for col, code in SERIES.items():
+
+    for col, series_id in SERIES.items():
         try:
-            raw = web.DataReader(code, "fred", s, e)
-            raw.index = pd.to_datetime(raw.index)
-            raw.index.name = "Date"
-            frames[col] = raw.iloc[:, 0].rename(col)
+            url = (
+                f"https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id={series_id}"
+                f"&observation_start={start}"
+                f"&observation_end={end_date}"
+                f"&api_key={api_key}"
+                f"&file_type=json"
+            )
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            obs  = resp.json().get("observations", [])
+            if not obs:
+                continue
+            df_s = pd.DataFrame(obs)[["date", "value"]]
+            df_s["value"] = pd.to_numeric(df_s["value"], errors="coerce")
+            df_s["date"]  = pd.to_datetime(df_s["date"])
+            df_s = df_s.dropna().set_index("date")["value"].rename(col)
+            frames[col] = df_s
         except Exception:
-            pass   # individual series failed; skip it
+            pass
 
     if not frames:
         return None, 0.0
@@ -596,6 +608,17 @@ with st.sidebar:
         help="Required for AI scenario analysis. Get one at console.anthropic.com"
     )
 
+    # Try Streamlit secrets first, then manual input
+    _fred_secret = st.secrets.get("FRED_API_KEY", "") if hasattr(st, "secrets") else ""
+    fred_api_key = _fred_secret or st.text_input(
+        "FRED API Key",
+        type="password",
+        placeholder="abcdef1234567890...",
+        help="Free key from https://fredaccount.stlouisfed.org/apikey — required for live macro data"
+    )
+    if not fred_api_key:
+        st.caption("🔑 No FRED key → synthetic macro data will be used.")
+
     st.markdown('<div class="section-title">📅 DATA RANGE</div>',
                 unsafe_allow_html=True)
     data_years = st.slider("Historical Years", 3, 12, 10)
@@ -659,7 +682,7 @@ with st.spinner("Fetching live USD/INR data..."):
         )
 
     if use_fred:
-        macro_df, fred_pct = load_macro_fred(f"{datetime.today().year - data_years}-01-01")
+        macro_df, fred_pct = load_macro_fred(f"{datetime.today().year - data_years}-01-01", api_key=fred_api_key)
         if macro_df is None or fred_pct == 0.0:
             macro_df = build_synthetic_macro(usdinr_monthly.index)
             st.warning("⚠ FRED unavailable — using synthetic macro data for modelling.", icon="⚠")
