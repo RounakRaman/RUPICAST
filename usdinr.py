@@ -53,7 +53,6 @@ st.markdown("""
   }
   .stApp { background: #0a0e17; }
 
-  /* Header */
   .main-header {
     font-family: 'Space Mono', monospace;
     font-size: 2.2rem;
@@ -73,7 +72,6 @@ st.markdown("""
     margin-top: 2px;
   }
 
-  /* Metric cards */
   .metric-card {
     background: #111827;
     border: 1px solid #1e2d45;
@@ -99,7 +97,6 @@ st.markdown("""
   .metric-delta-up   { color: #22c55e; font-size: 0.8rem; }
   .metric-delta-down { color: #ef4444; font-size: 0.8rem; }
 
-  /* Section headers */
   .section-title {
     font-family: 'Space Mono', monospace;
     font-size: 0.7rem;
@@ -111,7 +108,6 @@ st.markdown("""
     margin: 24px 0 16px;
   }
 
-  /* AI response box */
   .ai-response {
     background: #0f172a;
     border: 1px solid #1e3a5f;
@@ -124,7 +120,6 @@ st.markdown("""
     color: #cbd5e1;
   }
 
-  /* Scenario pills */
   .scenario-pill {
     display: inline-block;
     padding: 4px 12px;
@@ -138,13 +133,11 @@ st.markdown("""
   .pill-base  { background: #1e1b4b; color: #818cf8; border: 1px solid #3730a3; }
   .pill-bear  { background: #3b0764; color: #e879f9; border: 1px solid #7e22ce; }
 
-  /* Sidebar */
   section[data-testid="stSidebar"] {
     background: #0d1117;
     border-right: 1px solid #1e2d45;
   }
 
-  /* Tabs */
   .stTabs [data-baseweb="tab-list"] {
     background: #0d1117;
     border-bottom: 1px solid #1e2d45;
@@ -165,10 +158,8 @@ st.markdown("""
     background: transparent !important;
   }
 
-  /* Plotly chart background match */
   .js-plotly-plot { border-radius: 8px; }
 
-  /* Input styling */
   .stTextArea textarea {
     background: #0d1117;
     border: 1px solid #1e2d45;
@@ -178,7 +169,6 @@ st.markdown("""
   .stSlider > div { color: #e2e8f0; }
   div[data-testid="stMetricValue"] { font-family: 'Space Mono', monospace; }
 
-  /* Live badge */
   .live-badge {
     display: inline-block;
     background: #052e16;
@@ -215,7 +205,7 @@ PLOTLY_LAYOUT = dict(
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=3600)   # refresh every hour
+@st.cache_data(ttl=3600)
 def load_live_usdinr(period_years: int = 10) -> pd.DataFrame:
     """Fetch daily USD/INR from Yahoo Finance, resample to monthly."""
     end   = datetime.today()
@@ -227,15 +217,14 @@ def load_live_usdinr(period_years: int = 10) -> pd.DataFrame:
         return pd.DataFrame()
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df = df[["Close"]].rename(columns={"Close": "USD_INR"})
-    monthly = df.resample("MS").mean()   # Month Start
+    monthly = df.resample("MS").mean()
     return monthly
 
 
 @st.cache_data(ttl=86400)
 def load_macro_fred(start="2014-01-01", api_key: str = ""):
     """
-    Fetch FRED macro series via direct REST API (requires free FRED API key).
-    Falls back gracefully series-by-series.
+    Fetch FRED macro series via direct REST API.
     Returns (DataFrame | None, pct_fetched 0.0-1.0).
     """
     if not api_key:
@@ -248,7 +237,7 @@ def load_macro_fred(start="2014-01-01", api_key: str = ""):
         "US_Rate_EFFR":        "FEDFUNDS",
     }
 
-    end_date   = datetime.today().strftime("%Y-%m-%d")
+    end_date = datetime.today().strftime("%Y-%m-%d")
     frames = {}
 
     for col, series_id in SERIES.items():
@@ -307,108 +296,153 @@ def build_synthetic_macro(idx: pd.DatetimeIndex) -> pd.DataFrame:
     return df
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RBI REPO RATE — KNOWN CHANGE TABLE
+# Updated manually; RBI meets ~6×/year so this stays current with minimal upkeep.
+# Source: Reserve Bank of India press releases
+# ─────────────────────────────────────────────────────────────────────────────
+_RBI_REPO_KNOWN = [
+    # (effective_date,  rate_pct)
+    ("2019-06-01",  5.75),
+    ("2019-08-01",  5.40),
+    ("2019-10-01",  5.15),
+    ("2019-12-01",  5.15),
+    ("2020-03-01",  5.15),
+    ("2020-03-27",  4.40),   # emergency COVID cut
+    ("2020-05-01",  4.00),   # further COVID cut
+    ("2022-05-01",  4.40),
+    ("2022-06-01",  4.90),
+    ("2022-08-01",  5.40),
+    ("2022-09-01",  5.90),
+    ("2022-12-01",  6.25),
+    ("2023-02-01",  6.50),
+    # Held at 6.50 through Apr 2025
+    ("2025-02-01",  6.25),   # Feb 2025 cut
+    ("2025-04-01",  6.00),   # Apr 2025 cut
+    ("2025-06-01",  5.75),   # Jun 2025 cut
+    ("2025-08-01",  5.50),   # Aug 2025 cut
+    ("2025-12-01",  5.25),   # Dec 2025 cut
+    # Add future decisions here as they occur
+]
+
+
+def _build_repo_from_known(idx: pd.DatetimeIndex) -> pd.Series:
+    """
+    Convert the known-change table into a monthly step-function series
+    aligned to the supplied DatetimeIndex.
+    """
+    changes = pd.Series(
+        {pd.Timestamp(d): r for d, r in _RBI_REPO_KNOWN}
+    ).sort_index()
+
+    # Build daily series from first known date to end of idx, then resample
+    full_range = pd.date_range(changes.index[0], idx[-1], freq="D")
+    daily = changes.reindex(full_range).ffill()
+    monthly = daily.resample("MS").last()
+    # Reindex to match target index, forward-fill any gaps at the start
+    out = monthly.reindex(idx).ffill().bfill().rename("RBI_Repo_Rate")
+    return out
+
+
 @st.cache_data(ttl=86400)
-def load_rbi_repo_rate() -> tuple:
+def load_rbi_repo_rate_fred(fred_key: str, start: str = "2014-01-01") -> tuple:
     """
-    Fetch RBI Repo Rate history from RBI's DBIE portal.
-    Tries multiple public RBI endpoints and falls back gracefully.
-    Returns (Series | None, source_label).
+    PRIMARY: Fetch India Central Bank Rate from FRED (OECD series).
+      - IRSTCB01INM156N  Central Bank Rates, monthly  (best match to repo rate)
+      - IRSTCI01INM156N  Call Money/Interbank Rate, monthly (fallback)
+
+    Both series come from the OECD Main Economic Indicators and track the
+    policy rate very closely. They may lag 1-2 months behind live RBI decisions.
+
+    SECONDARY PATCH: Any months after the FRED series ends are filled using
+    the hardcoded _RBI_REPO_KNOWN table so recent RBI decisions are captured.
+
+    Returns (Series, source_label).
     """
-    HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/html, */*",
-    }
+    if not fred_key:
+        return None, "No FRED key"
 
-    # ── Attempt 1: RBI DBIE REST API (repo rate series ID: II-B-1) ──
-    try:
-        url = (
-            "https://api.rbi.org.in/api/v3/findbyfacets?"
-            "facets=B02&startDate=2010-01-01"
-            f"&endDate={datetime.today().strftime('%Y-%m-%d')}"
-            "&frequency=M&lang=EN"
-        )
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        data = resp.json()
-        records = data.get("data", data.get("Data", []))
-        if records:
-            df = pd.DataFrame(records)
-            # column names vary — try to find date + value cols
-            date_col  = next((c for c in df.columns if "date" in c.lower()), None)
-            val_col   = next((c for c in df.columns if any(
-                k in c.lower() for k in ["repo","rate","value","val"])), None)
-            if date_col and val_col:
-                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-                df[val_col]  = pd.to_numeric(df[val_col], errors="coerce")
-                s = df.dropna(subset=[date_col, val_col]).set_index(date_col)[val_col]
-                s.index = s.index - MonthBegin(1)
-                s = s.resample("MS").last().rename("RBI_Repo_Rate")
-                if len(s) > 12:
-                    return s, "RBI DBIE API"
-    except Exception:
-        pass
+    end_date = datetime.today().strftime("%Y-%m-%d")
 
-    # ── Attempt 2: RBI DBIE CSV download (key monetary rates table) ──
-    try:
-        csv_url = (
-            "https://rbidbie.rbi.org.in/scripts/BS_NSDPDisplay.aspx"
-            "?param=B&Series=B02&DateRange=2010-2025&Language=EN&output=csv"
-        )
-        resp = requests.get(csv_url, headers=HEADERS, timeout=15)
-        df   = pd.read_csv(io.StringIO(resp.text), skiprows=2)
-        df.columns = [c.strip() for c in df.columns]
-        date_col = df.columns[0]
-        rate_col = next((c for c in df.columns if "repo" in c.lower()), df.columns[1])
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
-        df[rate_col] = pd.to_numeric(
-            df[rate_col].astype(str).str.replace("%","").str.strip(), errors="coerce"
-        )
-        s = df.dropna(subset=[date_col, rate_col]).set_index(date_col)[rate_col]
-        s.index = s.index - MonthBegin(1)
-        s = s.resample("MS").last().rename("RBI_Repo_Rate")
-        if len(s) > 12:
-            return s, "RBI DBIE CSV"
-    except Exception:
-        pass
+    for series_id, label in [
+        ("IRSTCB01INM156N", "FRED IRSTCB01INM156N (OECD Central Bank Rate)"),
+        ("IRSTCI01INM156N", "FRED IRSTCI01INM156N (OECD Call Money Rate)"),
+    ]:
+        try:
+            url = (
+                f"https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id={series_id}"
+                f"&observation_start={start}"
+                f"&observation_end={end_date}"
+                f"&api_key={fred_key}"
+                f"&file_type=json"
+            )
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            obs = resp.json().get("observations", [])
+            if not obs:
+                continue
 
-    # ── Attempt 3: Wikipedia / known public table ──
-    try:
-        wiki_url = "https://en.wikipedia.org/wiki/Repo_rate_in_India"
-        resp  = requests.get(wiki_url, headers=HEADERS, timeout=12)
-        dfs   = pd.read_html(io.StringIO(resp.text))
-        for df in dfs:
-            df.columns = [str(c).lower().strip() for c in df.columns]
-            if any("repo" in c or "rate" in c for c in df.columns):
-                date_col = next((c for c in df.columns if "date" in c or "year" in c), None)
-                rate_col = next((c for c in df.columns if "repo" in c or "rate" in c), None)
-                if date_col and rate_col:
-                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
-                    df[rate_col] = pd.to_numeric(
-                        df[rate_col].astype(str).str.replace("%",""), errors="coerce"
-                    )
-                    s = df.dropna(subset=[date_col, rate_col]).set_index(date_col)[rate_col]
-                    s.index = s.index - MonthBegin(1)
-                    s = s.resample("MS").last().ffill().rename("RBI_Repo_Rate")
-                    if len(s) > 12:
-                        return s, "Wikipedia (public)"
-    except Exception:
-        pass
+            df = pd.DataFrame(obs)[["date", "value"]]
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df["date"]  = pd.to_datetime(df["date"])
+            s = df.dropna().set_index("date")["value"]
+            s.index = s.index - MonthBegin(1)
+            s = s.resample("MS").last().rename("RBI_Repo_Rate")
 
-    return None, "Synthetic"
+            if len(s) < 12:
+                continue
+
+            # ── Patch recent months from the known-change table ────────────
+            known_patch = _build_repo_from_known(
+                pd.date_range(s.index[0], datetime.today(), freq="MS")
+            )
+            # Use FRED data where available; known-table fills the tail
+            fred_end = s.index[-1]
+            patch_tail = known_patch[known_patch.index > fred_end]
+            if not patch_tail.empty:
+                s = pd.concat([s, patch_tail])
+
+            return s, f"{label} + recent-patch"
+
+        except Exception:
+            continue
+
+    return None, "FRED unavailable"
+
+
+@st.cache_data(ttl=86400)
+def load_rbi_repo_rate(fred_key: str = "") -> tuple:
+    """
+    Unified RBI Repo Rate loader.
+
+    Priority:
+      1. FRED IRSTCB01INM156N  (OECD Central Bank Rate, monthly)
+      2. FRED IRSTCI01INM156N  (OECD Call Money Rate, monthly)
+      3. Hardcoded known-change table (no external dependency)
+
+    The known-change table is used to patch the tail of the FRED series
+    and as a full fallback when no FRED key is provided.
+    """
+    # ── Try FRED first ────────────────────────────────────────────────────
+    if fred_key:
+        s, src = load_rbi_repo_rate_fred(fred_key)
+        if s is not None and len(s) >= 12:
+            return s, src
+
+    # ── Full fallback: known-change table only ────────────────────────────
+    # Build over a generous historical window
+    idx = pd.date_range("2014-01-01", datetime.today(), freq="MS")
+    s   = _build_repo_from_known(idx)
+    return s, "Hardcoded RBI decisions table"
 
 
 @st.cache_data(ttl=86400)
 def load_rbi_fx_reserves() -> tuple:
     """
-    Fetch India FX Reserves from RBI DBIE or FRED (as fallback).
+    Fetch India FX Reserves from FRED (RESIRUSD).
     Returns (Series | None, source_label).
     """
-    HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-    # ── Try FRED first (RESIRUSD = India total reserves) ──
     try:
         fred_key = st.session_state.get("fred_api_key", "")
         if fred_key:
@@ -423,14 +457,13 @@ def load_rbi_fx_reserves() -> tuple:
                 df = pd.DataFrame(obs)[["date","value"]]
                 df["value"] = pd.to_numeric(df["value"], errors="coerce")
                 df["date"]  = pd.to_datetime(df["date"])
-                s = df.dropna().set_index("date")["value"] / 1e9  # convert to USD bn
+                s = df.dropna().set_index("date")["value"] / 1e9
                 s.index = s.index - MonthBegin(1)
                 s = s.resample("MS").last().rename("Total_Reserves_USD")
                 if len(s) > 12:
                     return s, "FRED (RESIRUSD)"
     except Exception:
         pass
-
     return None, "Synthetic"
 
 
@@ -455,7 +488,6 @@ def load_india_cpi_rbi(fred_key: str = "") -> tuple:
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
             df["date"]  = pd.to_datetime(df["date"])
             s = df.dropna().set_index("date")["value"]
-            # convert index level to YoY %
             s = s.pct_change(12) * 100
             s.index = s.index - MonthBegin(1)
             s = s.resample("MS").last().rename("Ind_CPI")
@@ -520,11 +552,6 @@ def forecast_levels(result, exog_future_scaled, last_level, steps=6) -> pd.DataF
 
 def ai_scenario_analysis(news_text: str, macro_context: dict,
                           current_rate: float, api_key: str) -> dict:
-    """
-    Call Claude to extract macro signals from news and return
-    Bull / Base / Bear scenario forecasts with reasoning.
-    Returns a dict with keys: bull, base, bear, summary, signals.
-    """
     client = anthropic.Anthropic(api_key=api_key)
 
     system = """You are a senior FX macro strategist specialising in USD/INR.
@@ -577,7 +604,6 @@ Provide your scenario analysis."""
         messages=[{"role": "user", "content": user_msg}]
     )
     raw = message.content[0].text.strip()
-    # strip json fences if present
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
@@ -585,10 +611,6 @@ Provide your scenario analysis."""
 def ai_quantify_scenario(scenario: str, macro_deltas: dict,
                           result, exog_scaled, last_level: float,
                           steps: int = 6) -> pd.DataFrame:
-    """
-    Translate AI scenario (bull/base/bear) into quantified macro shocks
-    and re-run the ARIMAX model with perturbed exogenous variables.
-    """
     shocks = {
         "bull": {"US_Rate_EFFR": -0.25, "Crude_Oil": -5,
                  "Total_Reserves_USD": 10, "CPI_USA": -0.1},
@@ -603,7 +625,7 @@ def ai_quantify_scenario(scenario: str, macro_deltas: dict,
         if col in future_exog.columns:
             future_exog[col] = future_exog[col] + shock
 
-    fc  = result.get_forecast(steps=steps, exog=future_exog)
+    fc   = result.get_forecast(steps=steps, exog=future_exog)
     mean = fc.predicted_mean
     ci   = fc.conf_int()
     lvl  = last_level + mean.cumsum()
@@ -637,7 +659,6 @@ def plot_usdinr(hist: pd.Series, forecast_df: pd.DataFrame = None,
             line=dict(color="rgba(0,0,0,0)"), name="95% CI",
             showlegend=True
         ))
-        # vertical dotted line at forecast start
         fig.add_vline(x=str(forecast_df.index[0]),
                       line=dict(color="#475569", dash="dot", width=1))
     fig.update_layout(title=title, **PLOTLY_LAYOUT)
@@ -645,13 +666,11 @@ def plot_usdinr(hist: pd.Series, forecast_df: pd.DataFrame = None,
 
 
 def plot_scenarios(hist: pd.Series, scenarios: dict) -> go.Figure:
-    """scenarios = {'bull': df, 'base': df, 'bear': df}"""
     COLORS = {"bull": "#4ade80", "base": "#818cf8", "bear": "#e879f9"}
     LABELS = {"bull": "🟢 Bull — INR Strengthens",
               "base": "🟣 Base — Range-Bound",
               "bear": "🔴 Bear — INR Weakens"}
     fig = go.Figure()
-    # Historical
     fig.add_trace(go.Scatter(
         x=hist.index[-36:], y=hist.values[-36:],
         name="Historical", line=dict(color="#f7c948", width=2)
@@ -685,7 +704,6 @@ def plot_seasonality(monthly: pd.Series) -> go.Figure:
     fig = make_subplots(rows=2, cols=2,
         subplot_titles=["Monthly Seasonal Pattern", "YoY Returns by Month",
                         "Distribution of Monthly Returns", "Seasonal Decompose – Trend"])
-    # 1. Bar chart seasonality
     colors = ["#4ade80" if v < 0 else "#ef4444" for v in seasonal.values]
     fig.add_trace(go.Bar(
         x=["Jan","Feb","Mar","Apr","May","Jun",
@@ -693,7 +711,6 @@ def plot_seasonality(monthly: pd.Series) -> go.Figure:
         y=seasonal.values, marker_color=colors, name="Seasonal Deviation"
     ), row=1, col=1)
 
-    # 2. Year-on-year monthly returns heatmap
     df2 = df.copy()
     df2["Return"] = df2["USD_INR"].pct_change() * 100
     pivot = df2.pivot_table(values="Return", index="Year", columns="Month")
@@ -705,14 +722,12 @@ def plot_seasonality(monthly: pd.Series) -> go.Figure:
         colorbar=dict(x=0.48, thickness=10)
     ), row=1, col=2)
 
-    # 3. Distribution of monthly changes
     df2.dropna(subset=["Return"], inplace=True)
     fig.add_trace(go.Histogram(
         x=df2["Return"], nbinsx=30,
         marker_color="#f7c948", opacity=0.8, name="Return dist."
     ), row=2, col=1)
 
-    # 4. Trend (simple decompose)
     try:
         dec = seasonal_decompose(monthly.dropna(), model="additive", period=12)
         fig.add_trace(go.Scatter(
@@ -773,16 +788,15 @@ with st.sidebar:
         help="Required for AI scenario analysis. Get one at console.anthropic.com"
     )
 
-    # Try Streamlit secrets first, then manual input
     _fred_secret = st.secrets.get("FRED_API_KEY", "") if hasattr(st, "secrets") else ""
     fred_api_key = _fred_secret or st.text_input(
         "FRED API Key",
         type="password",
         placeholder="abcdef1234567890...",
-        help="Free key from https://fredaccount.stlouisfed.org/apikey — required for live macro data"
+        help="Free key from https://fredaccount.stlouisfed.org/apikey — used for all macro data including RBI Repo Rate"
     )
     if not fred_api_key:
-        st.caption("🔑 No FRED key → synthetic macro data will be used.")
+        st.caption("🔑 No FRED key → synthetic macro + hardcoded RBI rate table.")
 
     st.markdown('<div class="section-title">📅 DATA RANGE</div>',
                 unsafe_allow_html=True)
@@ -805,7 +819,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.caption("Data: Yahoo Finance, FRED. Model: ARIMAX (statsmodels). AI: Claude Sonnet.")
+    st.caption("Data: Yahoo Finance, FRED (OECD). RBI Rate: FRED IRSTCB01INM156N + hardcoded patch. AI: Claude Sonnet.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -832,7 +846,6 @@ st.markdown("---")
 # LOAD DATA
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Store fred key in session state so cache functions can read it ──
 st.session_state["fred_api_key"] = fred_api_key
 
 with st.spinner("Fetching live data from all sources..."):
@@ -851,8 +864,9 @@ with st.spinner("Fetching live data from all sources..."):
         )
         usdinr_source = "Synthetic"
 
-    # ── FRED macro series (US data) ──
-    DATA_SOURCES = {}   # col -> source label
+    DATA_SOURCES = {}
+
+    # ── FRED macro series ──
     if use_fred and fred_api_key:
         macro_df, fred_pct = load_macro_fred(
             f"{datetime.today().year - data_years}-01-01", api_key=fred_api_key
@@ -875,41 +889,37 @@ with st.spinner("Fetching live data from all sources..."):
         for c in macro_df.columns:
             DATA_SOURCES[c] = "Synthetic (no FRED key)"
 
-    # ── RBI Repo Rate ──
-    rbi_series, rbi_source = load_rbi_repo_rate()
+    # ── RBI Repo Rate — unified loader (FRED → hardcoded table) ──
+    rbi_series, rbi_source = load_rbi_repo_rate(fred_key=fred_api_key)
     DATA_SOURCES["RBI_Repo_Rate"] = rbi_source
 
-    # ── India FX Reserves (FRED RESIRUSD or synthetic) ──
+    # ── India FX Reserves ──
     reserves_series, reserves_source = load_rbi_fx_reserves()
     DATA_SOURCES["Total_Reserves_USD"] = reserves_source
 
-    # ── India CPI (FRED INDCPIALLMINMEI or synthetic) ──
+    # ── India CPI ──
     ind_cpi_series, ind_cpi_source = load_india_cpi_rbi(fred_key=fred_api_key)
     DATA_SOURCES["Ind_CPI"] = ind_cpi_source
 
     DATA_SOURCES["USD_INR"] = usdinr_source
 
-# ── Merge all sources into one DataFrame ──
+# ── Merge all sources ──
 combined = usdinr_monthly.copy()
 
-# Merge FRED macro
 if macro_df is not None:
     combined = combined.join(macro_df, how="left")
 
-# Override with live RBI Repo Rate if fetched
-if rbi_series is not None and rbi_source != "Synthetic":
+# RBI Repo Rate (always available — either FRED or hardcoded table)
+if rbi_series is not None:
     rbi_reindexed = rbi_series.reindex(combined.index).ffill().bfill()
     combined["RBI_Repo_Rate"] = rbi_reindexed
 
-# Override with live FX Reserves if fetched
 if reserves_series is not None and reserves_source != "Synthetic":
     combined["Total_Reserves_USD"] = reserves_series.reindex(combined.index).ffill().bfill()
 
-# Override with live India CPI if fetched
 if ind_cpi_series is not None and ind_cpi_source != "Synthetic":
     combined["Ind_CPI"] = ind_cpi_series.reindex(combined.index).ffill().bfill()
 
-# Fill any still-missing columns with synthetic (never scalar constants — ADF crashes)
 _synth = build_synthetic_macro(combined.index)
 for _col in ["RBI_Repo_Rate", "Total_Reserves_USD", "Ind_CPI",
              "CPI_USA", "Crude_Oil", "Trade_Balance_India", "US_Rate_EFFR"]:
@@ -923,7 +933,7 @@ FEATURE_COLS = [c for c in ["CPI_USA","Crude_Oil","Trade_Balance_India",
                              "US_Rate_EFFR","RBI_Repo_Rate","Total_Reserves_USD","Ind_CPI"]
                 if c in combined.columns]
 
-# ── Live Spot Metrics ─────────────────────────────────────────────────────────
+# ── Live Spot Metrics ──
 m1, m2, m3, m4 = st.columns(4)
 spot_rate = spot["rate"] if spot["ok"] else combined["USD_INR"].iloc[-1]
 prev_rate = spot["prev"] if spot["ok"] else combined["USD_INR"].iloc[-2]
@@ -968,6 +978,11 @@ with m4:
 
 st.markdown("---")
 
+# ── Data Source Summary ──────────────────────────────────────────────────────
+with st.expander("📡 Data Sources", expanded=False):
+    src_rows = [{"Variable": k, "Source": v} for k, v in DATA_SOURCES.items()]
+    st.dataframe(pd.DataFrame(src_rows), hide_index=True, width="stretch")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1008,7 +1023,6 @@ with tab1:
     fig1 = plot_usdinr(y, forecast_df)
     st.plotly_chart(fig1, width='stretch')
 
-    # Forecast table
     st.markdown('<div class="section-title">FORECAST VALUES</div>',
                 unsafe_allow_html=True)
     fc_display = forecast_df.copy()
@@ -1017,7 +1031,6 @@ with tab1:
     fc_display = fc_display.round(4)
     st.dataframe(fc_display, width='stretch')
 
-    # Train-test backtest
     with st.expander("📉 Backtest Performance (Train/Test Split)"):
         split = "2023-01-01"
         y_tr  = y_diff.loc[:split]; y_te = y_diff.loc[split:]
@@ -1105,12 +1118,10 @@ with tab2:
                 ai_result = None
 
         if ai_result:
-            # ── Summary ───────────────────────────────────────────────────
             st.markdown(f'<div class="ai-response">📌 <b>AI Macro Narrative</b><br><br>'
                         f'{ai_result.get("summary","")}</div>',
                         unsafe_allow_html=True)
 
-            # ── Signals ───────────────────────────────────────────────────
             signals = ai_result.get("signals", [])
             if signals:
                 st.markdown('<div class="section-title">KEY SIGNALS DETECTED</div>',
@@ -1122,7 +1133,6 @@ with tab2:
                 )
                 st.markdown(sig_html, unsafe_allow_html=True)
 
-            # ── Scenario Cards ────────────────────────────────────────────
             st.markdown('<div class="section-title">SCENARIO BREAKDOWN</div>',
                         unsafe_allow_html=True)
             sc1, sc2, sc3 = st.columns(3)
@@ -1148,7 +1158,6 @@ with tab2:
             render_scenario_card(sc2, "base", "🟣", "pill-base")
             render_scenario_card(sc3, "bear", "🔴", "pill-bear")
 
-            # ── Fan Chart ─────────────────────────────────────────────────
             st.markdown('<div class="section-title">SCENARIO FAN CHART</div>',
                         unsafe_allow_html=True)
 
@@ -1167,7 +1176,6 @@ with tab2:
                 fig_fan = plot_scenarios(y, scenarios_fc)
                 st.plotly_chart(fig_fan, width='stretch')
 
-            # ── Comparison table ──────────────────────────────────────────
             st.markdown('<div class="section-title">SCENARIO COMPARISON TABLE</div>',
                         unsafe_allow_html=True)
             rows = []
@@ -1185,7 +1193,6 @@ with tab2:
             st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
     else:
-        # Demo fan chart (no AI key needed)
         st.markdown('<div class="section-title">DEMO SCENARIO FAN CHART</div>',
                     unsafe_allow_html=True)
         demo = {}
@@ -1208,10 +1215,8 @@ with tab3:
     st.markdown('<div class="section-title">SEASONALITY & RETURN DECOMPOSITION</div>',
                 unsafe_allow_html=True)
     if len(combined) >= 24:
-        st.plotly_chart(plot_seasonality(combined["USD_INR"]),
-                        width='stretch')
+        st.plotly_chart(plot_seasonality(combined["USD_INR"]), width='stretch')
 
-        # Rolling stats table
         st.markdown('<div class="section-title">MONTHLY RETURN STATISTICS</div>',
                     unsafe_allow_html=True)
         df_m = combined["USD_INR"].to_frame()
@@ -1262,7 +1267,6 @@ with tab4:
                 unsafe_allow_html=True)
     st.plotly_chart(plot_residuals(result.resid), width='stretch')
 
-    # Coefficient table — built manually (SARIMAXResults has no summary2())
     st.markdown('<div class="section-title">COEFFICIENT TABLE</div>',
                 unsafe_allow_html=True)
     try:
@@ -1292,7 +1296,6 @@ with tab5:
                      columns=combined.columns, index=combined.index)
     ), width='stretch')
 
-    # Individual series charts
     st.markdown('<div class="section-title">TIME SERIES — KEY DRIVERS</div>',
                 unsafe_allow_html=True)
     DRIVER_COLORS = {
@@ -1315,11 +1318,9 @@ with tab5:
                 x=combined.index, y=combined[col],
                 name=col, line=dict(color=DRIVER_COLORS.get(col, "#94a3b8"), width=1.5)
             ), row=r + 1, col=c + 1)
-        fig_macro.update_layout(height=220 * rows, showlegend=False,
-                                **PLOTLY_LAYOUT)
+        fig_macro.update_layout(height=220 * rows, showlegend=False, **PLOTLY_LAYOUT)
         st.plotly_chart(fig_macro, width='stretch')
 
-    # Raw data download
     st.markdown('<div class="section-title">RAW DATA EXPORT</div>',
                 unsafe_allow_html=True)
     csv = combined.to_csv().encode("utf-8")
@@ -1331,11 +1332,11 @@ with tab5:
         width='stretch'
     )
 
-# ── Footer ────────────────────────────────────────────────────────────────────
+# ── Footer ──
 st.markdown("---")
 st.markdown(
     '<p style="text-align:center;font-family:Space Mono,monospace;font-size:0.65rem;'
     'color:#334155;letter-spacing:2px;">USD/INR MACRO INTELLIGENCE · ARIMAX + CLAUDE AI · '
-    'DATA: YAHOO FINANCE · FRED · NOT FINANCIAL ADVICE</p>',
+    'DATA: YAHOO FINANCE · FRED (OECD) · NOT FINANCIAL ADVICE</p>',
     unsafe_allow_html=True
 )
